@@ -1,108 +1,189 @@
-name: Build and Release Zed
+name: Release Build
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   build:
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: zed-linux-x64
+          # macOS
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: zed-macos-x64
+            artifact_name: zed
+            asset_name: zed-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: zed-macos-arm64
+            artifact_name: zed
+            asset_name: zed-macos-aarch64
+            
+          # Linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: zed
+            asset_name: zed-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: zed
+            asset_name: zed-linux-aarch64
+            
+          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: zed-windows-x64
+            artifact_name: zed.exe
+            asset_name: zed-windows-x86_64.exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: zed.exe
+            asset_name: zed-windows-aarch64.exe
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        target: ${{ matrix.target }}
-        toolchain: stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-    - name: Install dependencies (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libssl-dev pkg-config
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Build
-      run: cargo build --release --target ${{ matrix.target }}
+      # Linux specific dependencies
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libgtk-3-dev \
+            libgdk-pixbuf2.0-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libssl-dev \
+            cmake \
+            pkg-config
 
-    - name: Package artifacts
-      run: |
-        # 根据不同平台打包构建产物
-        if [ "${{ matrix.os }}" == "windows-latest" ]; then
-          mkdir -p release
-          cp target/${{ matrix.target }}/release/zed.exe release/
-          cd release && zip -r ../${{ matrix.artifact_name }}.zip . && cd ..
-        else
-          mkdir -p release
-          cp target/${{ matrix.target }}/release/zed release/
-          tar -czf ${{ matrix.artifact_name }}.tar.gz -C release .
-        fi
+      # macOS specific dependencies
+      - name: Install macOS dependencies
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install cmake
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.artifact_name }}
-        path: ${{ matrix.artifact_name }}.*
+      # Windows specific dependencies
+      - name: Install Windows dependencies
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install cmake
 
-  create-release:
+      - name: Build release binary
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin zed
+
+      - name: Strip binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+      - name: Create archive
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            7z a ../../../${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
+          else
+            tar czf ../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+          fi
+          cd -
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}.tar.gz
+            ${{ matrix.asset_name }}.zip
+          retention-days: 30
+
+  release:
+    name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: startsWith(github.ref, 'refs/tags/v')
     
     steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: List files
-      run: ls -R artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-      with:
-        tag_name: build-${{ github.run_number }}
-        release_name: Build ${{ github.run_number }}
-        draft: false
-        prerelease: true
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
 
-    - name: Upload Release Assets
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: artifacts/${{ matrix.artifact_name }}/${{ matrix.artifact_name }}.tar.gz
-        asset_name: ${{ matrix.artifact_name }}.tar.gz
-        asset_content_type: application/gzip
+  nightly:
+    name: Nightly Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Upload Windows Release Assets
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: artifacts/zed-windows-x64/zed-windows-x64.zip
-        asset_name: zed-windows-x64.zip
-        asset_content_type: application/zip
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Delete previous nightly release
+        uses: dev-drprasad/delete-tag-and-release@v1.1
+        with:
+          tag_name: nightly
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_release: true
+
+      - name: Create Nightly Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: true
